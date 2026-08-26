@@ -1,7 +1,10 @@
+import argparse
 import json
 import subprocess
 from pathlib import Path
 from typing import Any, Dict, Iterable, Optional, Set
+
+SUBPROCESS_TIMEOUT_SECONDS = 30
 
 
 # ExifTool 결과에서 제거할 태그들
@@ -59,13 +62,17 @@ def run_exiftool_json(
     if extra_args:
         cmd[1:1] = list(extra_args)
 
-    proc = subprocess.run(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        check=False,
-    )
+    try:
+        proc = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+            timeout=SUBPROCESS_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f"exiftool timed out after {SUBPROCESS_TIMEOUT_SECONDS}s: {image_path}")
 
     # exiftool 실패(파일 깨짐/권한/바이너리 문제 등)
     if proc.returncode != 0:
@@ -123,18 +130,25 @@ def extract_metadata_to_json_file(
     image_path: str | Path,
     output_json_path: str | Path,
     *,
+    is_real: bool = True,
     exiftool_bin: str = "exiftool",
     exclude_tags: Optional[Set[str]] = None,
     pretty: bool = True,
-) -> Dict[str, Any]:
+) -> Optional[Dict[str, Any]]:
     """
-    ✅ 메인 로직 함수 (프레임워크에서 Real 판정 후 호출하면 됨)
+    ✅ 메인 로직 함수 — 프레임워크의 Real/AI 판정 결과를 `is_real`로 받아 연결한다.
+    AI 생성물로 판정된 경우(is_real=False)에는 메타데이터를 추출하지 않고 None을 반환한다
+    (heimdall-backend의 image_pipeline.py가 final_is_ai=False일 때만 메타데이터를 추출하는 것과 동일한 컨벤션).
 
-    1) image_path로 exiftool 실행해서 메타데이터 dict 획득
-    2) (ExifToolVersion, Directory, FilePermissions, SourceFile) 등 제외
-    3) 결과를 output_json_path에 저장
-    4) filtered dict를 반환(추가 처리에 사용 가능)
+    1) is_real 확인 (AI 판정이면 여기서 종료)
+    2) image_path로 exiftool 실행해서 메타데이터 dict 획득
+    3) (ExifToolVersion, Directory, FilePermissions, SourceFile) 등 제외
+    4) 결과를 output_json_path에 저장
+    5) filtered dict를 반환(추가 처리에 사용 가능)
     """
+    if not is_real:
+        return None
+
     # 1) 추출
     meta = run_exiftool_json(image_path, exiftool_bin=exiftool_bin)
 
@@ -155,14 +169,36 @@ def extract_metadata_to_json_file(
     return filtered
 
 
-# --- Example usage (backend friend가 이 부분을 프레임워크에 연결) ---
-if __name__ == "__main__":
-    img = ""
-    out = ""
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="이미지 메타데이터 추출(exiftool) 및 민감 필드 제거")
+    parser.add_argument("image_path", help="메타데이터를 추출할 이미지 파일 경로")
+    parser.add_argument(
+        "-o", "--output",
+        help="결과 JSON 저장 경로 (기본: <이미지 파일명>_metadata.json, 같은 폴더)",
+    )
+    parser.add_argument("--exiftool-bin", default="exiftool", help="exiftool 실행 파일 경로 (기본: PATH의 exiftool)")
+    parser.add_argument(
+        "--is-ai", action="store_true",
+        help="업스트림에서 AI 생성물로 판정된 경우 지정 — 지정 시 메타데이터를 추출하지 않고 종료(Real 판정 분기 시뮬레이션)",
+    )
+    return parser.parse_args()
 
-    extract_metadata_to_json_file(
+
+if __name__ == "__main__":
+    args = _parse_args()
+
+    img = Path(args.image_path)
+    out = Path(args.output) if args.output else img.with_name(f"{img.stem}_metadata.json")
+
+    result = extract_metadata_to_json_file(
         img,
         out,
-        exiftool_bin="exiftool",  # 또는 "/usr/bin/exiftool"
+        is_real=not args.is_ai,
+        exiftool_bin=args.exiftool_bin,
         pretty=True,
     )
+
+    if result is None:
+        print("AI 생성물로 판정되어 메타데이터를 추출하지 않았습니다 (--is-ai).")
+    else:
+        print(f"메타데이터 저장 완료: {out}")
